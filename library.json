@@ -1,0 +1,24 @@
+{
+  "name": "libFWCheck",
+  "version": "1.0.0",
+  "description": "Firmware CRC verification library with hardware acceleration support and dual-copy voting",
+  "keywords": ["crc", "firmware", "verification", "integrity", "stm32"],
+  "authors": [
+    {
+      "name": "CANInputsOutputs Team"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/example/libFWCheck"
+  },
+  "license": "MIT",
+  "frameworks": ["arduino", "stm32cube"],
+  "platforms": ["ststm32", "native"],
+  "build": {
+    "srcFilter": [
+      "+<*.c>",
+      "+<*.h>"
+    ]
+  }
+}
