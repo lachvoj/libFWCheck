@@ -7,13 +7,17 @@ This script:
 2. Locates the .fwcheck section (via linker symbols from ELF)
 3. Calculates CRC32 over firmware content (from start to CRC section)
 4. Injects magic number and two CRC copies into the .fwcheck section
+5. Optionally injects firmware version string (from git describe)
 
 Usage in platformio.ini:
     extra_scripts = post:lib/libFWCheck/scripts/fwcheck.py
 
 Build flags:
-    -DFWCHECK_USE_HW_CRC   : Use hardware CRC polynomial (0x04C11DB7)
-    (default)              : Use software CRC polynomial (0xEDB88320)
+    -DFWCHECK_ENABLED              : Enable CRC injection (required)
+    -DFWCHECK_USE_HW_CRC           : Use hardware CRC polynomial (0x04C11DB7)
+    -DFWCHECK_INCLUDE_FW_VERSION   : Include firmware version string
+    -DFWCHECK_FW_VERSION_SIZE=N    : Set version string size (default 32)
+    (default)                      : Use software CRC polynomial (0xEDB88320)
 
 Author: libFWCheck
 License: MIT
@@ -43,6 +47,9 @@ CRC32_POLY_SW = 0xEDB88320   # Standard CRC32 (bit-reversed form)
 
 # Section size: magic(4) + CRC1(4) + CRC2(4) = 12 bytes
 FWCHECK_SECTION_SIZE = 12
+
+# Default FW version string size (including null terminator)
+FWCHECK_FW_VERSION_SIZE_DEFAULT = 32
 
 
 # ============================================================================
@@ -109,6 +116,54 @@ def crc32_hw(data: bytes) -> int:
                 crc = (crc << 1) & 0xFFFFFFFF
     
     return crc
+
+
+# ============================================================================
+# FW Version Extraction
+# ============================================================================
+
+def get_fw_version(repo_path: str = None) -> str:
+    """
+    Get firmware version string using git describe.
+    
+    Uses 'git describe --always --dirty' to get version info:
+    - With tags: 'v1.2.3' or 'v1.2.3-5-gabcdef0'
+    - Without tags: 'abcdef0' (short commit hash)
+    - With uncommitted changes: adds '-dirty' suffix
+    
+    Args:
+        repo_path: Path to git repository (uses cwd if None)
+        
+    Returns:
+        Version string from git describe
+        
+    Raises:
+        RuntimeError: If git command fails (git not installed or not a repo)
+    """
+    import subprocess
+    
+    cmd = ['git', 'describe', '--always', '--dirty']
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=repo_path
+        )
+        return result.stdout.strip()
+        
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"git describe failed: {e.stderr.strip()}\n"
+            f"Ensure you are in a git repository and git is installed."
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "git command not found. Please install git or disable "
+            "FWCHECK_INCLUDE_FW_VERSION build flag."
+        )
 
 
 # ============================================================================
@@ -193,7 +248,7 @@ def patch_elf_file(elf_path: str, info: dict, crc_section: bytes, verbose: bool 
     Args:
         elf_path: Path to firmware .elf file
         info: Section info dictionary from get_fwcheck_info_from_elf()
-        crc_section: 12-byte CRC section data (magic + CRC1 + CRC2)
+        crc_section: CRC section data (magic + CRC1 + CRC2 + optional git version)
         verbose: Print status messages
         
     Returns:
@@ -273,7 +328,8 @@ def patch_elf_file(elf_path: str, info: dict, crc_section: bytes, verbose: bool 
 # ============================================================================
 
 def inject_crc(bin_path: str, elf_path: str, use_hw_crc: bool = False, 
-               verbose: bool = True, patch_elf: bool = True) -> bool:
+               verbose: bool = True, patch_elf: bool = True,
+               fw_version_size: int = 0, repo_path: str = None) -> bool:
     """
     Calculate and inject CRC into firmware binary and optionally ELF file.
     
@@ -283,26 +339,34 @@ def inject_crc(bin_path: str, elf_path: str, use_hw_crc: bool = False,
         use_hw_crc: Use hardware CRC polynomial if True
         verbose: Print status messages
         patch_elf: Also patch the ELF file for debugger flashing
+        fw_version_size: Size of FW version field (0 = disabled)
+        repo_path: Path to git repository for version extraction
         
     Returns:
         True if successful, False otherwise
     """
     try:
+        # Calculate total section size
+        section_size = FWCHECK_SECTION_SIZE
+        if fw_version_size > 0:
+            section_size += fw_version_size
+        
         # Get section info from ELF
         info = get_fwcheck_info_from_elf(elf_path)
         
         if verbose:
             print(f"[FWCheck] Firmware start:    0x{info['fw_start']:08X}")
-            print(f"[FWCheck] CRC section start: 0x{info['section_start']:08X}")
-            print(f"[FWCheck] CRC section end:   0x{info['section_end']:08X}")
+            print(f"[FWCheck] Section start:     0x{info['section_start']:08X}")
+            print(f"[FWCheck] Section end:       0x{info['section_end']:08X}")
             print(f"[FWCheck] Firmware size:     {info['fw_size']} bytes")
+            print(f"[FWCheck] Section size:      {section_size} bytes")
         
         # Read binary file
         with open(bin_path, 'rb') as f:
             bin_data = bytearray(f.read())
         
         # Ensure binary is large enough
-        required_size = info['section_offset'] + FWCHECK_SECTION_SIZE
+        required_size = info['section_offset'] + section_size
         if len(bin_data) < required_size:
             # Extend binary with 0xFF (erased flash value)
             bin_data.extend(b'\xFF' * (required_size - len(bin_data)))
@@ -332,18 +396,36 @@ def inject_crc(bin_path: str, elf_path: str, use_hw_crc: bool = False,
         # Build CRC section: magic + CRC1 + CRC2
         crc_section = struct.pack('<III', FWCHECK_MAGIC, crc_value, crc_value)
         
+        # Add FW version if enabled
+        if fw_version_size > 0:
+            fw_version = get_fw_version(repo_path)
+            
+            # Truncate with warning if too long (leave room for null terminator)
+            max_len = fw_version_size - 1
+            if len(fw_version) > max_len:
+                if verbose:
+                    print(f"[FWCheck] WARNING: FW version '{fw_version}' truncated to {max_len} chars")
+                fw_version = fw_version[:max_len]
+            
+            # Encode and null-pad to exact size
+            fw_bytes = fw_version.encode('utf-8')
+            fw_bytes = fw_bytes + b'\x00' * (fw_version_size - len(fw_bytes))
+            crc_section += fw_bytes
+            
+            if verbose:
+                print(f"[FWCheck] FW version:        '{fw_version}'")
+        
         # Inject into binary
         offset = info['section_offset']
-        bin_data[offset:offset + FWCHECK_SECTION_SIZE] = crc_section
+        bin_data[offset:offset + section_size] = crc_section
         
         # Write modified binary
         with open(bin_path, 'wb') as f:
             f.write(bin_data)
         
         if verbose:
-            print(f"[FWCheck] Injected CRC at offset 0x{offset:08X}")
             print(f"[FWCheck] Magic: 0x{FWCHECK_MAGIC:08X} ('FWCH')")
-            print(f"[FWCheck] Successfully updated {bin_path}")
+            print(f"[FWCheck] Successfully patched BIN file at offset 0x{offset:X}")
         
         # Also patch the ELF file for debugger flashing
         if patch_elf:
@@ -377,9 +459,8 @@ def is_define_set(env, define_name: str) -> bool:
     build_flags = env.get("BUILD_FLAGS", [])
     for flag in build_flags:
         flag_str = str(flag)
+        # Match -DDEFINE or -DDEFINE=value
         if f'-D{define_name}' in flag_str or f'-D {define_name}' in flag_str:
-            return True
-        if define_name in flag_str and flag_str.startswith('-D'):
             return True
     
     # Check CPPDEFINES
@@ -392,6 +473,39 @@ def is_define_set(env, define_name: str) -> bool:
             return True
     
     return False
+
+
+def get_define_value(env, define_name: str, default=None):
+    """
+    Get the value of a preprocessor define from the build environment.
+    
+    Args:
+        env: PlatformIO environment
+        define_name: Name of the define to get value for
+        default: Default value if define not found or has no value
+        
+    Returns:
+        The define's value as string, or default if not found/no value
+    """
+    import re
+    
+    # Check BUILD_FLAGS for -DNAME=VALUE
+    build_flags = env.get("BUILD_FLAGS", [])
+    for flag in build_flags:
+        flag_str = str(flag)
+        # Match -DDEFINE=value
+        match = re.search(rf'-D\s*{re.escape(define_name)}=([^\s]+)', flag_str)
+        if match:
+            return match.group(1)
+    
+    # Check CPPDEFINES (tuple format: (name, value))
+    cppdefines = env.get("CPPDEFINES", [])
+    for define in cppdefines:
+        if isinstance(define, tuple) and len(define) >= 2:
+            if define[0] == define_name:
+                return str(define[1])
+    
+    return default
 
 
 def post_build_action(source, target, env):
@@ -407,6 +521,7 @@ def post_build_action(source, target, env):
     # Get paths
     build_dir = env.subst("$BUILD_DIR")
     prog_name = env.subst("$PROGNAME")
+    project_dir = env.subst("$PROJECT_DIR")
     
     bin_path = os.path.join(build_dir, f"{prog_name}.bin")
     elf_path = os.path.join(build_dir, f"{prog_name}.elf")
@@ -414,11 +529,32 @@ def post_build_action(source, target, env):
     # Check if hardware CRC is enabled
     use_hw_crc = is_define_set(env, 'FWCHECK_USE_HW_CRC')
     
+    # Check if FW version is enabled
+    fw_version_size = 0
+    if is_define_set(env, 'FWCHECK_INCLUDE_FW_VERSION'):
+        # Get custom size or use default
+        size_str = get_define_value(env, 'FWCHECK_FW_VERSION_SIZE')
+        if size_str:
+            try:
+                fw_version_size = int(size_str)
+            except ValueError:
+                print(f"[FWCheck] WARNING: Invalid FWCHECK_FW_VERSION_SIZE '{size_str}', using default")
+                fw_version_size = FWCHECK_FW_VERSION_SIZE_DEFAULT
+        else:
+            fw_version_size = FWCHECK_FW_VERSION_SIZE_DEFAULT
+    
     print(f"\n{'='*60}")
     print("libFWCheck: Injecting firmware CRC")
+    if fw_version_size > 0:
+        print(f"            FW version enabled ({fw_version_size} bytes)")
     print('='*60)
     
-    success = inject_crc(bin_path, elf_path, use_hw_crc, verbose=True, patch_elf=True)
+    success = inject_crc(
+        bin_path, elf_path, use_hw_crc, 
+        verbose=True, patch_elf=True,
+        fw_version_size=fw_version_size,
+        repo_path=project_dir
+    )
     
     print('='*60 + '\n')
     
@@ -447,17 +583,29 @@ if __name__ == "__main__":
                         help='Use hardware CRC polynomial (0x04C11DB7)')
     parser.add_argument('--no-patch-elf', action='store_true',
                         help='Do not patch the ELF file')
+    parser.add_argument('--fw-version', action='store_true',
+                        help='Include firmware version string (from git describe)')
+    parser.add_argument('--fw-version-size', type=int, 
+                        default=FWCHECK_FW_VERSION_SIZE_DEFAULT,
+                        help=f'Size of FW version field (default: {FWCHECK_FW_VERSION_SIZE_DEFAULT})')
+    parser.add_argument('--repo-path', type=str, default=None,
+                        help='Path to git repository (default: current directory)')
     parser.add_argument('--quiet', '-q', action='store_true',
                         help='Suppress output')
     
     args = parser.parse_args()
+    
+    # Determine FW version size (0 if disabled)
+    fw_version_size = args.fw_version_size if args.fw_version else 0
     
     success = inject_crc(
         args.bin_file,
         args.elf_file,
         use_hw_crc=args.hw_crc,
         verbose=not args.quiet,
-        patch_elf=not args.no_patch_elf
+        patch_elf=not args.no_patch_elf,
+        fw_version_size=fw_version_size,
+        repo_path=args.repo_path
     )
     
     sys.exit(0 if success else 1)

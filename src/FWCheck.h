@@ -51,10 +51,36 @@ extern "C" {
 
 /**
  * @def FWCHECK_SECTION_SIZE
- * @brief Size of CRC storage section in bytes
+ * @brief Size of CRC storage section in bytes (base size without FW version)
  * Layout: [4-byte magic][4-byte CRC1][4-byte CRC2] = 12 bytes
  */
 #define FWCHECK_SECTION_SIZE    12
+
+/**
+ * @def FWCHECK_INCLUDE_FW_VERSION
+ * @brief Define this to include firmware version string (from git describe)
+ * 
+ * When defined:
+ *   - Adds szFwVersion field to FWCheck_Storage_t structure
+ *   - Post-build script injects git describe --always --dirty output
+ *   - FWCheck_GetFwVersion() returns the stored version string
+ * 
+ * When not defined:
+ *   - No version string stored
+ *   - FWCheck_GetFwVersion() returns NULL
+ */
+
+/**
+ * @def FWCHECK_FW_VERSION_SIZE
+ * @brief Size of firmware version string buffer (including null terminator)
+ * Default: 32 bytes (sufficient for "v1.2.3-99-gabcdef12-dirty")
+ * Can be overridden via build flags: -DFWCHECK_FW_VERSION_SIZE=48
+ */
+#ifdef FWCHECK_INCLUDE_FW_VERSION
+    #ifndef FWCHECK_FW_VERSION_SIZE
+        #define FWCHECK_FW_VERSION_SIZE    32
+    #endif
+#endif
 
 /*******************************************************************************
  * Result Codes
@@ -88,11 +114,17 @@ typedef enum {
  * 
  * This structure is placed at the end of firmware by the linker script
  * and populated by the post-build Python script.
+ * 
+ * When FWCHECK_INCLUDE_FW_VERSION is defined, an additional field
+ * acFwVersion[FWCHECK_FW_VERSION_SIZE] is appended after the CRC copies.
  */
 typedef struct __attribute__((packed)) {
     uint32_t u32Magic;      /**< Magic number (FWCHECK_MAGIC) for validation */
     uint32_t u32CrcCopy1;   /**< Primary CRC32 copy */
     uint32_t u32CrcCopy2;   /**< Secondary CRC32 copy (backup) */
+#ifdef FWCHECK_INCLUDE_FW_VERSION
+    char acFwVersion[FWCHECK_FW_VERSION_SIZE]; /**< Firmware version (null-padded by build script) */
+#endif
 } FWCheck_Storage_t;
 
 /*******************************************************************************
@@ -170,6 +202,17 @@ uint32_t FWCheck_GetFwSize(void);
  * @return false if initialization failed
  */
 bool FWCheck_Init(void);
+
+/**
+ * @brief Get firmware version string stored in flash
+ * 
+ * Returns the version string (from git describe) injected during build.
+ * Only available when FWCHECK_INCLUDE_FW_VERSION is defined.
+ * 
+ * @return const char* pointer to null-terminated version string,
+ *         or NULL if feature disabled or magic invalid
+ */
+const char* FWCheck_GetFwVersion(void);
 
 #ifdef __cplusplus
 }

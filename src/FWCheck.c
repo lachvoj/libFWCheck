@@ -25,6 +25,9 @@ static const FWCheck_Storage_t _sFWCheckPlaceholder = {
     .u32Magic = 0xFFFFFFFF,     /* Will be replaced with FWCHECK_MAGIC */
     .u32CrcCopy1 = 0xFFFFFFFF,  /* Will be replaced with calculated CRC */
     .u32CrcCopy2 = 0xFFFFFFFF   /* Will be replaced with calculated CRC */
+#ifdef FWCHECK_INCLUDE_FW_VERSION
+    , .acFwVersion = { [0 ... (FWCHECK_FW_VERSION_SIZE - 1)] = 0xFF } /* Will be replaced with FW version (null-padded) */
+#endif
 };
 
 /*******************************************************************************
@@ -232,4 +235,28 @@ FWCheck_Result_t FWCheck_Verify(void)
     
     /* All three values differ = cannot determine correct value */
     return FWCHECK_CRC_MISMATCH;
+}
+
+const char* FWCheck_GetFwVersion(void)
+{
+#ifdef FWCHECK_INCLUDE_FW_VERSION
+    /* Check magic first to ensure section is valid */
+    if (FWCHECK_STORAGE_PTR->u32Magic != FWCHECK_MAGIC)
+    {
+        return NULL;
+    }
+    
+    /* Safety check: ensure string is null-terminated within buffer */
+    /* Post-build script null-pads, but verify last byte as safeguard */
+    if (FWCHECK_STORAGE_PTR->acFwVersion[FWCHECK_FW_VERSION_SIZE - 1] != '\0')
+    {
+        /* Buffer not properly null-terminated - return NULL for safety */
+        return NULL;
+    }
+    
+    return FWCHECK_STORAGE_PTR->acFwVersion;
+#else
+    /* Feature not enabled */
+    return NULL;
+#endif
 }
